@@ -1,1 +1,1 @@
-require 'mongoid_paperclip_queue'
+require 'mongoid_paperclip_sidekiq'

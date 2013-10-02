@@ -2,20 +2,21 @@
 begin
   require "paperclip"
 rescue LoadError
-  puts "Mongoid::PaperclipQueue requires that you install the Paperclip gem."
+  puts "Mongoid::PaperclipSidekiq requires that you install the Paperclip gem."
   exit
 end
-
-module Mongoid::PaperclipQueue
+require "sidekiq/worker"
+module Mongoid::PaperclipSidekiq
   
     class Queue
       
-      @queue = :paperclip
+      include ::Sidekiq::Worker
+      sidekiq_options :queue => :paperclip
       
       def self.enqueue(klass,field,id,*parents)
-        ::Resque.enqueue(self,klass,field,id,*parents)
+        perform_async(klass, field, id, *parents)
       end
-      def self.perform(klass,field,id,*parents)
+      def perform(klass,field,id,*parents)
         if parents.empty?
           klass = klass.constantize
         else
@@ -31,36 +32,6 @@ module Mongoid::PaperclipQueue
        
     end
     
-    module Redis
-      def server=(srv)
-        case srv
-        when String
-          if srv =~ /redis\:\/\//
-            server = ::Redis.connect(:url => srv, :thread_safe => true)
-          else
-            srv, namespace = srv.split('/', 2)
-            host, port, db = srv.split(':')
-            server = ::Redis.new(:host => host, :port => port,
-              :thread_safe => true, :db => db)
-          end
-          namespace ||= :delayed
-      
-          @server = ::Redis::Namespace.new(namespace, :redis => redis)
-        when ::Redis::Namespace
-          @server = srv
-        else
-          @server = ::Redis::Namespace.new(:delayed, :redis => srv)
-        end
-      end
-      
-      def server
-        return @server if @server
-        self.server = ::Redis.respond_to?(:connect) ? ::Redis.connect : "localhost:6379"
-        self.server
-      end        
-      extend self
-    end
-    
     def has_queued_attached_file(field, options = {})
 
 
@@ -73,11 +44,6 @@ module Mongoid::PaperclipQueue
       #send :include, InstanceMethods
       include InstanceMethods
 
-      # Invoke Paperclip's #has_attached_file method and passes in the
-      # arguments specified by the user that invoked Mongoid::Paperclip#has_mongoid_attached_file
-      if options[:logger].nil? && Mongoid::Config.logger.present?
-        options[:logger] = Mongoid::Config.logger
-      end
       has_attached_file(field, options)
       
       # halt processing initially, but allow override for reprocess!
@@ -87,12 +53,19 @@ module Mongoid::PaperclipQueue
         true
       end
       
+      field "#{field}_processing", type: Boolean, default: false
+      field "#{field}_processed", type: Boolean, default: false
+        
       self.send :after_save do
-        if self.changed.include? "#{field}_updated_at"
+        if self.changed.include? "#{field}_updated_at" and !self.send("#{field}_processing".to_sym)
           # add a Redis key for the application to check if we're still processing
           # we don't need it for the processing, it's just a helpful tool
-          Mongoid::PaperclipQueue::Redis.server.sadd(self.class.name, "#{field}:#{self.id.to_s}")
+          # Mongoid::PaperclipSidekiq::Redis.server.sadd(self.class.name, "#{field}:#{self.id.to_s}")
 
+          self.send("#{field}_processing=".to_sym, true)
+          self.send("#{field}_processed=".to_sym, false)
+          self.save
+          
           # check if the document is embedded. if so, we need that to find it later
           if self.embedded?
             parents = []
@@ -114,7 +87,7 @@ module Mongoid::PaperclipQueue
           end
 
           # then queue up our processing
-          Mongoid::PaperclipQueue::Queue.enqueue(*args)
+          Mongoid::PaperclipSidekiq::Queue.enqueue(*args)
         end
       end
       
@@ -135,7 +108,10 @@ module Mongoid::PaperclipQueue
       def do_reprocessing_on(field)
         @is_processing=true
         self.send(field.to_sym).reprocess!
-        Mongoid::PaperclipQueue::Redis.server.srem(self.class.name, "#{field}:#{self.id.to_s}")
+        self.send("#{field}_processing=".to_sym, false)
+        self.send("#{field}_processed=".to_sym, true)
+        self.save
+        #Mongoid::PaperclipSidekiq::Redis.server.srem(self.class.name, "#{field}:#{self.id.to_s}")
       end
 
     end
@@ -143,8 +119,11 @@ end
 module Paperclip
   class Attachment
     def processing?
-      @instance.respond_to?(:"#{name}_processing!") && (@instance.new_record? || Mongoid::PaperclipQueue::Redis.server.sismember(@instance.class.name, "#{@name}:#{@instance.id.to_s}"))
-    end    
+      @instance.send("#{name}_processing")
+    end
+    def processed?
+      @instance.send("#{name}_processed")
+    end
     
   end
 end
